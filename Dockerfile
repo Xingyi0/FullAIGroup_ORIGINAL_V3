@@ -5,14 +5,18 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV PIP_NO_CACHE_DIR=1
 ENV COMBERT_DIR=/workspace/ComfyUI
+
 WORKDIR $COMBERT_DIR
 
-# ---- 基础依赖：加入 gawk 修复 awk 不存在的问题 ----
+# ---- 基础与运行时依赖 + 构建工具链 ----
 RUN set -eux && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         git git-lfs wget unzip ca-certificates \
         libgl1 libglib2.0-0 ffmpeg \
+        build-essential python3-dev pkg-config cmake cython3 \
+        libffi-dev libssl-dev zlib1g-dev \
+        libjpeg-dev libpng-dev libturbojpeg0 \
         gawk && \
     git lfs install && \
     update-ca-certificates && \
@@ -35,16 +39,19 @@ RUN set -eux && \
     git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
     git clone https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git
 
-# ---- 合并并安装依赖（过滤冲突大件；加入更清晰的日志）----
+# ---- 合并/清洗/过滤 requirements 并安装 ----
 WORKDIR $COMBERT_DIR
 RUN set -eux; \
     (find custom_nodes -name "requirements.txt" -exec cat {} + || true) > /tmp/requirements_all.txt; \
-    # 若为空，直接跳过
     if [ ! -s /tmp/requirements_all.txt ]; then \
         echo "No requirements.txt found in custom_nodes. Skipping pip install."; \
     else \
-        echo "Raw combined requirements:"; head -n 50 /tmp/requirements_all.txt || true; \
-        # 过滤 torch/onnxruntime/xformers/triton/nvidia*/tensorrt 等大件，避免与基础镜像冲突
+        echo "Raw combined requirements (first 80 lines):"; head -n 80 /tmp/requirements_all.txt || true; \
+        # 清洗：去掉 \r、去掉 # 后注释（无论前面是否有空格）、trim 空白、去空行
+        gawk '{ gsub(/\r/, ""); sub(/#.*/, ""); $1=$1; if (length($0)>0) print }' \
+            /tmp/requirements_all.txt > /tmp/requirements_clean.txt; \
+        echo "Cleaned requirements (first 80 lines):"; head -n 80 /tmp/requirements_clean.txt || true; \
+        # 过滤冲突或超大依赖
         gawk 'BEGIN{IGNORECASE=1} \
             !/^torch([[:space:]=<>+.-].*)?$/ && \
             $0 !~ /^torchvision/ && \
@@ -54,19 +61,27 @@ RUN set -eux; \
             $0 !~ /^triton/ && \
             $0 !~ /^tensorrt/ && \
             $0 !~ /^nvidia-/ {print}' \
-            /tmp/requirements_all.txt > /tmp/requirements_runtime.txt; \
-        echo "Filtered runtime requirements (first 100 lines):"; head -n 100 /tmp/requirements_runtime.txt || true; \
+            /tmp/requirements_clean.txt > /tmp/requirements_runtime.txt; \
+        echo "Filtered runtime requirements (first 120 lines):"; head -n 120 /tmp/requirements_runtime.txt || true; \
         if [ -s /tmp/requirements_runtime.txt ]; then \
-            pip install --no-cache-dir -r /tmp/requirements_runtime.txt || { \
+            PIP_OPTS="--no-cache-dir --prefer-binary --default-timeout=120"; \
+            pip install $PIP_OPTS -r /tmp/requirements_runtime.txt -v || { \
                 echo "pip install failed. Showing filtered requirements to help debug:"; \
                 cat /tmp/requirements_runtime.txt; \
-                exit 1; \
+                echo "Retry per-package to identify failures..."; \
+                FAILED=0; \
+                while IFS= read -r pkg || [ -n "$pkg" ]; do \
+                    [ -z "$pkg" ] && continue; \
+                    echo ">>> Installing: $pkg"; \
+                    pip install $PIP_OPTS "$pkg" || { echo "### FAILED: $pkg"; FAILED=1; }; \
+                done < /tmp/requirements_runtime.txt; \
+                [ "$FAILED" -eq 0 ] || { echo "Some packages failed to install (see ### FAILED above)"; exit 1; }; \
             }; \
         else \
             echo "Filtered requirements list is empty. Skipping pip install."; \
         fi; \
     fi; \
-    rm -f /tmp/requirements_all.txt /tmp/requirements_runtime.txt
+    rm -f /tmp/requirements_all.txt /tmp/requirements_clean.txt /tmp/requirements_runtime.txt
 
 # ---- 模型目录 ----
 RUN mkdir -p models/checkpoints models/vae models/controlnet models/sams models/ultralytics/bbox \
@@ -91,15 +106,32 @@ RUN set -eux && \
     wget $WGET_OPTS https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/facerestore_models/GPEN-BFR-512.onnx -P models/facerestore_models/ && \
     wget $WGET_OPTS https://huggingface.co/ai-forever/Real-ESRGAN/resolve/main/RealESRGAN_x2.pth -P models/upscale_models/
 
-# ---- 解压 InsightFace ----
+# ---- 解压/重命名/软链 对齐工作流节点默认名 ----
 WORKDIR $COMBERT_DIR/models/insightface/models/
 RUN unzip -o buffalo_l.zip -d buffalo_l && rm -f buffalo_l.zip
 
-# ---- 路径重映射配置 ----
 WORKDIR $COMBERT_DIR
-RUN mkdir -p templates && \
+# VAE: sdxl_vae.safetensors -> sdxl.vae.safetensors  (AV_VAELoader 期望)  :contentReference[oaicite:6]{index=6}
+RUN ln -sf models/vae/sdxl_vae.safetensors models/vae/sdxl.vae.safetensors
+
+# Checkpoint: RealVisXL_* -> realvisxlV50_v50LightningBakedvae.safetensors (CheckpointLoaderSimple 期望)  :contentReference[oaicite:7]{index=7}
+RUN ln -sf models/checkpoints/RealVisXL_V5.0_Lightning_fp16.safetensors \
+       models/checkpoints/realvisxlV50_v50LightningBakedvae.safetensors
+
+# ---- templates 配置与文件放置 ----
+# 客户要求重映射到 Linux 路径，并确保 templates 目录存在。  :contentReference[oaicite:8]{index=8}
+RUN mkdir -p templates/FullAIGroupWikinger && \
     mkdir -p custom_nodes/ComfyUI-Custom-Scripts/user && \
     printf '{\n  "input": "$input/**/*.txt",\n  "output": "$output/**/*.txt",\n  "temp": "$temp/**/*.txt",\n  "templates": "/workspace/ComfyUI/templates/**/*.txt"\n}\n' \
       > custom_nodes/ComfyUI-Custom-Scripts/user/text_file_dirs.json
 
+# 将你上传的 Prompt.txt 放到工作流引用的位置；同时放置空的 Negativ.txt 以免节点报缺失。  :contentReference[oaicite:9]{index=9} :contentReference[oaicite:10]{index=10}
+COPY --chown=root:root ./Prompt.txt templates/FullAIGroupWikinger/Prompt.txt
+RUN test -f templates/FullAIGroupWikinger/Negativ.txt || touch templates/FullAIGroupWikinger/Negativ.txt
+
+# 可选：若你想兼容 JSON 里的 Windows 示例图像路径，可在容器里创建软链到 Linux 路径（如果你会放一张样图到 templates/Sampleimages/gruppe.jpg）
+# RUN mkdir -p templates/Sampleimages && \
+#     ln -s /workspace/ComfyUI/templates/Sampleimages/gruppe.jpg /C/AI/API_Server/Templates/Sampleimages/gruppe.jpg || true
+
+# 回到默认工作目录
 WORKDIR /
