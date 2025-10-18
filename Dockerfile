@@ -7,12 +7,13 @@ ENV PIP_NO_CACHE_DIR=1
 ENV COMBERT_DIR=/workspace/ComfyUI
 WORKDIR $COMBERT_DIR
 
-# ---- 基础依赖（含运行时库与证书、git-lfs）----
+# ---- 基础依赖：加入 gawk 修复 awk 不存在的问题 ----
 RUN set -eux && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         git git-lfs wget unzip ca-certificates \
-        libgl1 libglib2.0-0 ffmpeg && \
+        libgl1 libglib2.0-0 ffmpeg \
+        gawk && \
     git lfs install && \
     update-ca-certificates && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -34,24 +35,36 @@ RUN set -eux && \
     git clone https://github.com/kijai/ComfyUI-KJNodes.git && \
     git clone https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git
 
-# ---- 合并并安装依赖（过滤冲突大件）----
+# ---- 合并并安装依赖（过滤冲突大件；加入更清晰的日志）----
 WORKDIR $COMBERT_DIR
 RUN set -eux; \
-    # 合并 requirements
     (find custom_nodes -name "requirements.txt" -exec cat {} + || true) > /tmp/requirements_all.txt; \
-    # 过滤掉会与基础镜像冲突或极大拉依赖的包
-    awk 'BEGIN{IGNORECASE=1} \
-        !/^torch([[:space:]=<>-].*)?$/ && \
-        $0 !~ /^torchvision/ && \
-        $0 !~ /^torchaudio/ && \
-        $0 !~ /^xformers/ && \
-        $0 !~ /^onnxruntime/ && \
-        $0 !~ /^triton/ && \
-        $0 !~ /^tensorrt/ && \
-        $0 !~ /^nvidia-/ {print}' \
-        /tmp/requirements_all.txt > /tmp/requirements_runtime.txt; \
-    if [ -s /tmp/requirements_runtime.txt ]; then \
-        pip install --no-cache-dir -r /tmp/requirements_runtime.txt; \
+    # 若为空，直接跳过
+    if [ ! -s /tmp/requirements_all.txt ]; then \
+        echo "No requirements.txt found in custom_nodes. Skipping pip install."; \
+    else \
+        echo "Raw combined requirements:"; head -n 50 /tmp/requirements_all.txt || true; \
+        # 过滤 torch/onnxruntime/xformers/triton/nvidia*/tensorrt 等大件，避免与基础镜像冲突
+        gawk 'BEGIN{IGNORECASE=1} \
+            !/^torch([[:space:]=<>+.-].*)?$/ && \
+            $0 !~ /^torchvision/ && \
+            $0 !~ /^torchaudio/ && \
+            $0 !~ /^xformers/ && \
+            $0 !~ /^onnxruntime/ && \
+            $0 !~ /^triton/ && \
+            $0 !~ /^tensorrt/ && \
+            $0 !~ /^nvidia-/ {print}' \
+            /tmp/requirements_all.txt > /tmp/requirements_runtime.txt; \
+        echo "Filtered runtime requirements (first 100 lines):"; head -n 100 /tmp/requirements_runtime.txt || true; \
+        if [ -s /tmp/requirements_runtime.txt ]; then \
+            pip install --no-cache-dir -r /tmp/requirements_runtime.txt || { \
+                echo "pip install failed. Showing filtered requirements to help debug:"; \
+                cat /tmp/requirements_runtime.txt; \
+                exit 1; \
+            }; \
+        else \
+            echo "Filtered requirements list is empty. Skipping pip install."; \
+        fi; \
     fi; \
     rm -f /tmp/requirements_all.txt /tmp/requirements_runtime.txt
 
