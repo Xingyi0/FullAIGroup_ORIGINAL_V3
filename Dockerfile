@@ -1,6 +1,8 @@
 # 阶段 I: 使用 RunPod 官方的 ComfyUI Worker 基础镜像
 # 这是一个干净的 ComfyUI 安装，包含运行 Serverless API 所需的 RunPod Worker Handler
-FROM runpod/worker-comfyui:latest-base
+# FROM runpod/worker-comfyui:latest-base
+# 修正后的第一行 (使用已知的稳定版本，例如 5.2.0-base):
+FROM runpod/worker-comfyui:5.2.0-base
 
 # 设置默认 Shell 和工作目录
 SHELL ["/bin/bash", "-c"]
